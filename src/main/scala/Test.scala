@@ -1,12 +1,3 @@
-//
-// to stream data into the cluster open up netcat and echo sample records to it, one per line.
-//
-// nc -lk 9999
-// 2014-10-07T12:20:09Z;foo;1
-// 2014-10-07T12:21:09Z;foo;29
-// 2014-10-07T12:22:10Z;foo;1
-// 2014-10-07T12:23:11Z;foo;29
-
 import java.net._
 import java.io._
 import scala.io._
@@ -16,6 +7,7 @@ import java.util.Date
 import java.util.Random
 import java.util.TimeZone
 import javax.xml.bind.DatatypeConverter
+import java.text.SimpleDateFormat
 
 import kafka.producer.{ProducerConfig, KeyedMessage, Producer}
 
@@ -33,177 +25,97 @@ import com.datastax.driver.core.ConsistencyLevel
 import com.datastax.driver.core.utils.UUIDs
 
 object Config {
-  val sparkMasterHost = "127.0.0.1"
-  val cassandraHost = "127.0.0.1"
-  val cassandraKeyspace = "demo"
-  val cassandraCfCounters = "event_counters"
-  val cassandraCfEvents = "event_log"
-  val zookeeperHost = "localhost:2181"
-  val kafkaHost = "localhost:9092"
-  val kafkaTopic = "events"
-  val kafkaConsumerGroup = "spark-streaming-test"
-  val tcpHost = "localhost"
-  val tcpPort = 9999
+	//set properties for all services used for script
+	val sparkMasterHost = "127.0.0.1"
+	val cassandraHost = "127.0.0.1"
+	val cassandraKeyspace = "loyalty"
+	val cassandraCfCouponCounters = "coupon_counters"
+	val cassandraCfCouponEvents = "coupon_events"
+	val cassandraCfPDs = "personalized_deals"
+	val zookeeperHost = "localhost:2181"
+	val kafkaHost = "localhost:9092"
+	val kafkaTopic = "test"
+	val kafkaConsumerGroup = "spark-streaming-test"
 }
 
-case class Record(bucket:Long, time:Date, name:String, count:Long)
-
-case class RecordCount(bucket:Long, name:String, count:Long)
+//define class to hold records as they are parsed from the Kafka queue
+case class Record(bucket:Long, time:Date, offer_id:String, count:Long)
+//define class to hold aggregates as they wait to be written to Cassandra
+case class RecordCount(bucket:Long, offer_id:String, count:Long)
 
 object StreamConsumer {
+//setup and process all elements needed to consume messages from kafka and write to C*
 
-  def setup() : (SparkContext, StreamingContext, CassandraConnector) = {
-    val sparkConf = new SparkConf(true)
-      .set("spark.cassandra.connection.host", Config.cassandraHost)
-      .set("spark.cleaner.ttl", "3600")
-      .setMaster("local[12]")
-      .setAppName(getClass.getSimpleName)
+	//set up the contexts we will need to process messages
+	def setup() : (SparkContext, StreamingContext, CassandraConnector) = {
+		val sparkConf = new SparkConf(true)
+			.set("spark.cassandra.connection.host",Config.cassandraHost)
+			.set("spark.cleaner.ttl","3600")
+			.setMaster("local[12]")
+			.setAppName(getClass.getSimpleName)
 
-    // Connect to the Spark cluster:
-    val sc = new SparkContext(sparkConf)
-    val ssc = new StreamingContext(sc, Seconds(1))
-    val cc = CassandraConnector(sc.getConf)
-    createSchema(cc, Config.cassandraKeyspace, Config.cassandraCfCounters, Config.cassandraCfEvents)
-    return (sc, ssc, cc)
-  }
+		//connect to the spark cluster
+		val sc = new SparkContext(sparkConf)
+		val ssc = new StreamingContext(sc,Seconds(1))
+		val cc = CassandraConnector(sc.getConf)
+		return (sc,ssc,cc)
+	}
+	//need this to parse date from whatever format it is in Kafka. Important if using different language on consumer side.
+	def parseDate(str:String) : Date = {
+			val parsed_date = new java.text.SimpleDateFormat("yyyy-mm-dd hh:mm:ss").parse(str)
+			return parsed_date
+		}
+	//given a time, calculates the "minute bucket" used for aggregate and event storage bucketing
+	def minuteBucket(d:Date) : Long = {
+		return d.getTime() / (60*1000)
+	}
+	/*take an incoming Kafka message, parse and return a Record object. Note that the return statement
+	needs to define elemetns in order of how they return after being parsed from the kafka string.
+	*/
+	def parseMessage(msg:String) : Record = {
+		val arr = msg.split(",")
+		val time = parseDate(arr(1))
+		return Record(minuteBucket(time), time, arr(0), arr(2).toInt)
+	}
+	//Create Records objects from all messages. Create aggregate objects using combineByKey
+	def process(ssc : StreamingContext, input  : DStream[String]) {
+		val parsedRecords = input.map(parseMessage)
+		val bucketedRecords = parsedRecords.map(record => ((record.bucket, record.offer_id),record))
+		val	bucketedCounts = bucketedRecords.combineByKey(
+			(record:Record) => record.count,
+			(count:Long, record:Record) => (count + record.count),
+			(c1:Long, c2:Long) => (c1 + c2),
+			new HashPartitioner(1)
+			)
 
-  def parseDate(str:String) : Date = {
-    return javax.xml.bind.DatatypeConverter.parseDateTime(str).getTime()
-  }
+		val flattenCounts = bucketedCounts.map((agg) => RecordCount(agg._1._1,agg._1._2,agg._2))
 
-  def minuteBucket(d:Date) : Long = {
-    return d.getTime() / (60 * 1000)
-  }
+		parsedRecords.print()
+		//insert records into Cassandra
+		parsedRecords.saveToCassandra(Config.cassandraKeyspace, Config.cassandraCfCouponEvents)
+		flattenCounts.saveToCassandra(Config.cassandraKeyspace, Config.cassandraCfCouponCounters)
+		
 
-  def parseMessage(msg:String) : Record = {
-    val arr = msg.split(";")
-    val time = parseDate(arr(0))
-    return Record(minuteBucket(time), time, arr(1), arr(2).toInt)
-  }
+		sys.ShutdownHookThread {
+			ssc.stop(true,true)
+		}
 
-  def createSchema(cc:CassandraConnector, keySpaceName:String, counters:String, logs:String) = {
-    cc.withSessionDo { session =>
-      session.execute(s"DROP TABLE IF EXISTS ${keySpaceName}.${logs};")
-      session.execute(s"DROP TABLE IF EXISTS ${keySpaceName}.${counters};")
-
-      session.execute("CREATE TABLE IF NOT EXISTS " +
-                      s"${keySpaceName}.${logs} (name text, bucket bigint, count bigint, time timestamp, " +
-                      s"PRIMARY KEY((name, bucket), time));")
-
-      session.execute("CREATE TABLE IF NOT EXISTS " +
-                      s"${keySpaceName}.${counters} (name text, bucket bigint, count counter, " +
-                      s"PRIMARY KEY(name, bucket));")
-    }
-  }
-
-  def process(ssc : StreamingContext, input : DStream[String]) {
-    // for testing purposes you can use the alternative input below
-    // val input = sc.parallelize(sampleRecords)
-    val parsedRecords = input.map(parseMessage)
-    val bucketedRecords = parsedRecords.map(record => ((record.bucket, record.name), record))
-    val bucketedCounts = bucketedRecords.combineByKey(
-      (record:Record) => record.count,
-      (count:Long, record:Record) => (count + record.count),
-      (c1:Long, c2:Long) => (c1 + c2),
-      new HashPartitioner(1))
-
-    val flattenCounts = bucketedCounts.map((agg) => RecordCount(agg._1._1, agg._1._2, agg._2))
-
-    parsedRecords.print()
-    parsedRecords.saveToCassandra(Config.cassandraKeyspace, Config.cassandraCfEvents)
-    flattenCounts.saveToCassandra(Config.cassandraKeyspace, Config.cassandraCfCounters)
-
-    // https://twitter.com/pwendell/status/580242656082546688
-    sys.ShutdownHookThread {
-      ssc.stop(true, true)
-    }
-
-    ssc.start()
-    ssc.awaitTermination()
-  }
+		ssc.start()
+		ssc.awaitTermination()
+	}
 }
 
 object KafkaConsumer {
   def main(args: Array[String]) {
+  	//set values for contexts and connector to use in the process function
     val (sc, ssc, cc) = StreamConsumer.setup()
+    //create the DStream
     val input = KafkaUtils.createStream(
       ssc,
       Config.zookeeperHost,
       Config.kafkaConsumerGroup,
       Map(Config.kafkaTopic -> 1)).map(_._2)
+    //run the consumer process
     StreamConsumer.process(ssc, input)
-  }
-}
-
-object TcpConsumer {
-  def main(args: Array[String]) {
-    val (sc, ssc, cc) = StreamConsumer.setup()
-    val input = ssc.socketTextStream(Config.tcpHost, Config.tcpPort)
-    StreamConsumer.process(ssc, input)
-  }
-}
-
-object EventGenerator {
-
-  val eventNames = Array("thyrotome", "radioactivated", "toreutics", "metrological",
-    "adelina", "architecturally", "unwontedly", "histolytic", "clank", "unplagiarised",
-    "inconsecutive", "scammony", "pelargonium", "preaortic", "goalmouth", "adena",
-    "murphy", "vaunty", "confetto", "smiter", "chiasmatype", "fifo", "lamont", "acnode",
-    "mutating", "unconstrainable", "donatism", "discept")
-
-  def currentTimestamp() : String = {
-    val tz = TimeZone.getTimeZone("UTC")
-    val sdf = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'")
-    sdf.setTimeZone(tz)
-    val dateString = sdf.format(new java.util.Date)
-    return dateString
-  }
-
-  def randomEventName() : String = {
-    val rand = new Random(System.currentTimeMillis())
-    val random_index = rand.nextInt(eventNames.length)
-    return eventNames(random_index)
-  }
-
-  def generateEvent() : String = {
-    // message in the form of "2014-10-07T12:20:08Z;foo;1"
-    val eventCount = scala.util.Random.nextInt(10).toString()
-    return currentTimestamp() + ";" + randomEventName() + ";" + eventCount
-  }
-}
-
-object KafkaProducer {
- def main(args: Array[String]) {
-   val props = new Properties()
-   props.put("metadata.broker.list", Config.kafkaHost)
-   props.put("serializer.class", "kafka.serializer.StringEncoder")
-
-   val config = new ProducerConfig(props)
-   val producer = new Producer[String, String](config)
-
-   while(true) {
-     val event = EventGenerator.generateEvent();
-     println(event)
-     producer.send(new KeyedMessage[String, String](Config.kafkaTopic, event))
-     Thread.sleep(100)
-   }
- }
-}
-
-object TcpProducer {
-  def main(args: Array[String]) {
-    val server = new ServerSocket(Config.tcpPort)
-
-    while (true) {
-      val socket = server.accept()
-      val outstream = new PrintStream(socket.getOutputStream())
-      while (!outstream.checkError()) {
-        val event = EventGenerator.generateEvent();
-        println(event)
-        outstream.println(event)
-        Thread.sleep(100)
-      }
-      socket.close()
-    }
   }
 }
